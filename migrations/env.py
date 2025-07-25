@@ -21,7 +21,6 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 def get_database_url():
-    # Исправленная строка подключения (добавлен : после postgres)
     return "postgresql+asyncpg://postgres:2746@postgres:5432/file_storage"
 
 def run_migrations_offline():

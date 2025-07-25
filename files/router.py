@@ -1,22 +1,17 @@
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import func
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List
-from fastapi import Response
-from zipfile import ZipFile
+from typing import List, Optional
 import io
-import os
 import uuid
 import hashlib
-from typing import List, Dict, Union
-from fastapi_cache.decorator import cache
 import logging
+from zipfile import ZipFile
 
-from auth.dependencies import get_current_user
+from auth.dependencies import get_current_user, get_current_admin
 from config.database import get_db
 from models.user import User
 from models.file import FileModel
@@ -25,114 +20,131 @@ from config.settings import settings
 router = APIRouter(prefix="/files", tags=["files"])
 logger = logging.getLogger(__name__)
 
-# Настройки
-CACHE_EXPIRE = timedelta(minutes=5)  # Время жизни кеша
+# Константы
 STORAGE_DIR = Path(settings.STORAGE_DIR)
+ADMIN_ACTIVITY_TIMEOUT = timedelta(minutes=5)  # 5 минут активности админа
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
 
-def generate_temp_id(path: str) -> str:
-    """Генерирует временный ID на основе хеша пути"""
+def generate_file_id(path: str) -> str:
+    """Генерация временного ID для файлов из storage"""
     return f"temp_{hashlib.md5(path.encode()).hexdigest()[:8]}"
 
-@router.get("/")
-@cache(expire=CACHE_EXPIRE, namespace="files_list")
-async def list_all_files(
-    skip: int = Query(0, ge=0, description="Смещение"),
-    limit: int = Query(10, le=100, description="Лимит"),
+async def is_admin_active(db: AsyncSession) -> bool:
+    """Проверяет, активен ли администратор"""
+    result = await db.execute(
+        select(User)
+        .where(User.role == "admin")
+        .where(User.last_active >= datetime.utcnow() - ADMIN_ACTIVITY_TIMEOUT)
+    )
+    return result.scalars().first() is not None
+
+@router.get("/", summary="Получить список файлов")
+async def list_files(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, le=100),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Получить все файлы (из storage и БД) с пагинацией"""
+    """
+    Возвращает список файлов:
+    - Если администратор активен: все файлы из storage
+    - Если неактивен: только зарегистрированные файлы из БД
+    """
     try:
-        # 1. Получаем файлы из БД
-        db_files = (await db.execute(select(FileModel))).scalars().all()
-        db_files_map = {f.path: f for f in db_files}
-        
-        # 2. Сканируем storage
-        STORAGE_DIR.mkdir(exist_ok=True, parents=True)
+        admin_active = await is_admin_active(db)
         all_files = []
-        
-        for item in STORAGE_DIR.rglob("*"):
-            if item.is_file():
-                rel_path = str(item.relative_to(STORAGE_DIR))
-                try:
-                    stat = item.stat()
-                    modified = datetime.fromtimestamp(stat.st_mtime).isoformat()
-                    created_at = datetime.fromtimestamp(stat.st_ctime).isoformat()
-                except Exception as e:
-                    logger.warning(f"Could not get file stats for {rel_path}: {str(e)}")
-                    modified = created_at = "unknown"
-                
-                file_info = {
-                    "id": generate_temp_id(rel_path),
-                    "name": item.name,
-                    "filename": item.name,
-                    "path": rel_path,
-                    "size": stat.st_size if 'stat' in locals() else 0,
-                    "modified": modified,
-                    "created_at": created_at,
-                    "owner_id": None,
-                    "registered": False,
-                    "type": "file"
-                }
-                
-                # Добавляем данные из БД если есть
-                db_file = db_files_map.get(rel_path)
-                if db_file:
+
+        # Получаем файлы из storage (если admin активен)
+        if admin_active:
+            for item in STORAGE_DIR.rglob("*"):
+                if item.is_file():
                     try:
-                        file_info.update({
-                            "id": db_file.id,
-                            "filename": db_file.filename or item.name,
-                            "owner_id": db_file.owner_id,
-                            "created_at": db_file.created_at.isoformat() if db_file.created_at else created_at,
-                            "registered": True
+                        stat = item.stat()
+                        all_files.append({
+                            "id": generate_file_id(str(item.relative_to(STORAGE_DIR))),
+                            "name": item.name,
+                            "path": str(item.relative_to(STORAGE_DIR)),
+                            "size": stat.st_size,
+                            "modified": datetime.fromtimestamp(stat.st_mtime),
+                            "source": "storage"
                         })
                     except Exception as e:
-                        logger.error(f"Error processing DB file {rel_path}: {str(e)}")
+                        logger.error(f"Error processing file {item}: {str(e)}")
                         continue
-                
-                all_files.append(file_info)
+
+        # Добавляем файлы из БД
+        db_files = (await db.execute(select(FileModel))).scalars().all()
+        for file in db_files:
+            file_path = STORAGE_DIR / file.path
+            if file_path.exists():
+                stat = file_path.stat()
+                all_files.append({
+                    "id": file.id,
+                    "name": file.filename,
+                    "path": file.path,
+                    "size": stat.st_size,
+                    "modified": datetime.fromtimestamp(stat.st_mtime),
+                    "owner_id": file.owner_id,
+                    "source": "database"
+                })
+
+        # Удаляем дубликаты (если файл есть и в storage и в БД)
+        unique_files = {}
+        for file in all_files:
+            key = file["path"]
+            if key not in unique_files or file["source"] == "database":
+                unique_files[key] = file
+
+        # Сортировка и пагинация
+        sorted_files = sorted(unique_files.values(), 
+                            key=lambda x: x["modified"], 
+                            reverse=True)
         
-        # 3. Сортировка по дате создания (новые сначала)
-        all_files.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-        
-        # 4. Пагинация
-        total = len(all_files)
-        paginated = all_files[skip:skip + limit]
+        paginated = sorted_files[skip:skip + limit]
         
         return {
             "items": paginated,
             "pagination": {
-                "total": total,
+                "total": len(unique_files),
                 "skip": skip,
                 "limit": limit,
-                "has_more": (skip + limit) < total
-            }
+                "has_more": (skip + limit) < len(unique_files)
+            },
+            "admin_active": admin_active
         }
-        
+
     except Exception as e:
-        logger.error(f"List files error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-@router.post("/upload")
+        logger.error(f"Failed to list files: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve files")
+
+@router.post("/upload", summary="Загрузить файл")
 async def upload_file(
     file: UploadFile = File(...),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Загрузить новый файл"""
+    """Загружает файл в storage и регистрирует в БД"""
     try:
+        # Проверка размера файла
+        if file.size > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Max size: {MAX_FILE_SIZE/1024/1024}MB"
+            )
+
         STORAGE_DIR.mkdir(exist_ok=True, parents=True)
         
-        # Генерируем уникальное имя
+        # Генерация уникального имени
         file_ext = Path(file.filename).suffix
         unique_name = f"{uuid.uuid4()}{file_ext}"
         file_path = STORAGE_DIR / unique_name
         
-        # Сохраняем файл
-        content = await file.read()
-        with open(file_path, "wb") as buffer:
-            buffer.write(content)
+        # Сохранение файла
+        contents = await file.read()
+        with open(file_path, "wb") as f:
+            f.write(contents)
         
-        # Регистрируем в БД
+        # Регистрация в БД
         db_file = FileModel(
             filename=file.filename,
             path=unique_name,
@@ -146,26 +158,47 @@ async def upload_file(
             "id": db_file.id,
             "filename": file.filename,
             "path": unique_name,
-            "size": len(content),
+            "size": len(contents),
             "registered": True
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         await db.rollback()
-        logger.error(f"Upload error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Upload failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="File upload failed")
 
-@router.get("/download/{file_id}")
+@router.get("/download/{file_id}", summary="Скачать файл")
 async def download_file(
-    file_id: int,
+    file_id: str,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Скачать файл по ID"""
+    """Скачивает файл по ID (поддерживает временные ID для storage)"""
     try:
-        # Ищем только зарегистрированные файлы
+        # Для временных ID (файлы из storage)
+        if file_id.startswith("temp_"):
+            # Находим файл по относительному пути
+            result = await db.execute(
+                select(FileModel).where(FileModel.path == file_id[5:])
+            )
+            file = result.scalars().first()
+            
+            if not file:
+                file_path = STORAGE_DIR / file_id[5:]
+                if not file_path.exists():
+                    raise HTTPException(status_code=404, detail="File not found")
+                
+                return FileResponse(
+                    file_path,
+                    filename=file_path.name,
+                    media_type="application/octet-stream"
+                )
+        
+        # Для зарегистрированных файлов
         file = await db.get(FileModel, file_id)
-        if not file or file.owner_id != user.id:
+        if not file:
             raise HTTPException(status_code=404, detail="File not found")
         
         file_path = STORAGE_DIR / file.path
@@ -178,63 +211,67 @@ async def download_file(
             media_type="application/octet-stream"
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Download error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Download failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="File download failed")
 
-@router.get("/info/{file_id}")
-async def get_file_info(
-    file_id: int,
+@router.get("/download-multiple", summary="Скачать несколько файлов")
+async def download_multiple_files(
+    file_ids: List[str] = Query(...),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Информация о файле по ID"""
+    """Скачивает несколько файлов в ZIP-архиве"""
     try:
-        file = await db.get(FileModel, file_id)
-        if not file or file.owner_id != user.id:
-            raise HTTPException(status_code=404, detail="File not found")
+        zip_buffer = io.BytesIO()
+        with ZipFile(zip_buffer, "w") as zip_file:
+            for file_id in file_ids:
+                if file_id.startswith("temp_"):
+                    file_path = STORAGE_DIR / file_id[5:]
+                    if file_path.exists():
+                        zip_file.write(file_path, file_path.name)
+                else:
+                    file = await db.get(FileModel, file_id)
+                    if file:
+                        file_path = STORAGE_DIR / file.path
+                        if file_path.exists():
+                            zip_file.write(file_path, file.filename)
         
-        file_path = STORAGE_DIR / file.path
-        if not file_path.exists():
-            raise HTTPException(status_code=404, detail="File missing in storage")
-        
-        stat = file_path.stat()
-        return {
-            "id": file.id,
-            "filename": file.filename,
-            "path": file.path,
-            "size": stat.st_size,
-            "created_at": file.created_at.isoformat(),
-            "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-            "owner_id": file.owner_id,
-            "registered": True
-        }
+        zip_buffer.seek(0)
+        return StreamingResponse(
+            zip_buffer,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": "attachment; filename=files.zip",
+                "Content-Length": str(zip_buffer.getbuffer().nbytes)
+            }
+        )
         
     except Exception as e:
-        logger.error(f"File info error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Multi-download failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Archive creation failed")
 
-@router.post("/register")
-async def register_existing_file(
-    path: str = Query(..., description="Относительный путь"),
-    filename: str = Query(None, description="Имя файла"),
+@router.post("/register", summary="Зарегистрировать файл")
+async def register_file(
+    path: str = Query(...),
+    filename: Optional[str] = Query(None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Зарегистрировать существующий файл"""
+    """Регистрирует существующий файл из storage в БД"""
     try:
         file_path = STORAGE_DIR / path
         if not file_path.exists():
             raise HTTPException(status_code=404, detail="File not found in storage")
         
-        # Проверяем дубликаты
         existing = await db.execute(
             select(FileModel).where(FileModel.path == path)
         )
-        if existing.scalar():
+        if existing.scalars().first():
             raise HTTPException(status_code=400, detail="File already registered")
         
-        # Создаем запись
         db_file = FileModel(
             filename=filename or file_path.name,
             path=path,
@@ -251,20 +288,20 @@ async def register_existing_file(
             "registered": True
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         await db.rollback()
-        logger.error(f"Registration error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Registration failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="File registration failed")
 
-@router.post("/register-all")
-async def register_all_unregistered(
-
-    user: User = Depends(get_current_user),
+@router.post("/register-all", summary="Зарегистрировать все файлы")
+async def register_all_files(
+    user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    """Зарегистрировать все незарегистрированные файлы"""
+    """Регистрирует все незарегистрированные файлы из storage (только для admin)"""
     try:
-        # Получаем все зарегистрированные пути
         registered = set(
             (await db.execute(select(FileModel.path))).scalars().all()
         )
@@ -293,102 +330,5 @@ async def register_all_unregistered(
         
     except Exception as e:
         await db.rollback()
-        logger.error(f"Mass registration error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
-
-@router.post("/upload-multiple")
-async def upload_multiple_files(
-    files: List[UploadFile] = File(...),
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Загрузить несколько файлов одновременно"""
-    try:
-        STORAGE_DIR.mkdir(exist_ok=True, parents=True)
-        uploaded_files = []
-        
-        for file in files:
-            # Генерируем уникальное имя для каждого файла
-            file_ext = Path(file.filename).suffix
-            unique_name = f"{uuid.uuid4()}{file_ext}"
-            file_path = STORAGE_DIR / unique_name
-            
-            # Сохраняем файл
-            content = await file.read()
-            with open(file_path, "wb") as buffer:
-                buffer.write(content)
-            
-            # Регистрируем в БД
-            db_file = FileModel(
-                filename=file.filename,
-                path=unique_name,
-                owner_id=user.id
-            )
-            db.add(db_file)
-            await db.commit()
-            await db.refresh(db_file)
-            
-            uploaded_files.append({
-                "id": db_file.id,
-                "filename": file.filename,
-                "path": unique_name,
-                "size": len(content),
-                "registered": True
-            })
-        
-        return {"files": uploaded_files}
-        
-    except Exception as e:
-        await db.rollback()
-        logger.error(f"Multiple upload error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/download-multiple")
-async def download_multiple_files(
-    file_ids: List[int] = Query(..., description="Список ID файлов"),
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Скачать несколько файлов в виде ZIP-архива"""
-    try:
-        # Проверяем права на все файлы
-        files = []
-        for file_id in file_ids:
-            file = await db.get(FileModel, file_id)
-            if not file or file.owner_id != user.id:
-                raise HTTPException(
-                    status_code=404, 
-                    detail=f"File with ID {file_id} not found or access denied"
-                )
-            file_path = STORAGE_DIR / file.path
-            if not file_path.exists():
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"File with ID {file_id} missing in storage"
-                )
-            files.append((file, file_path))
-        
-        # Создаем ZIP-архив в памяти
-        zip_buffer = io.BytesIO()
-        with ZipFile(zip_buffer, "w") as zip_file:
-            for file, file_path in files:
-                zip_file.write(file_path, file.filename)
-        
-        zip_buffer.seek(0)
-        
-        # Возвращаем архив как ответ
-        return Response(
-            zip_buffer.getvalue(),
-            media_type="application/zip",
-            headers={
-                "Content-Disposition": "attachment; filename=files.zip",
-                "Content-Length": str(zip_buffer.getbuffer().nbytes)
-            }
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Multiple download error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Bulk registration failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Bulk registration failed")

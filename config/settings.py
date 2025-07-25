@@ -8,15 +8,16 @@ class Settings(BaseSettings):
     STORAGE_DIR: str = "storage"
     LOG_LEVEL: str = "info"
     
-    # Настройки аутентификации
+    # Настройки аутентификации securepassword123
     SECRET_KEY: str = "your-secret-key-here"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ADMIN_SECRET_KEY: str = "qwerty" 
     
     # Настройки PostgreSQL (для Docker)
     POSTGRES_USER: str = "postgres"
     POSTGRES_PASSWORD: str = "2746"
-    POSTGRES_HOST: str = "postgres"  # Изменили с localhost на имя сервиса
+    POSTGRES_HOST: str = "postgres"  
     POSTGRES_PORT: str = "5432"
     POSTGRES_DB: str = "file_storage"
     
