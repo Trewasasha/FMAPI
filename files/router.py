@@ -175,6 +175,7 @@ async def download_file(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
+    print(file_id, user)
     """Скачивает файл по ID (поддерживает временные ID для storage)"""
     try:
         # 1. Обработка временных файлов (начинаются с 'temp_')
@@ -191,7 +192,7 @@ async def download_file(
 
         # 2. Обработка обычных файлов (числовые ID)
         try:
-            file_id_int = int(file_id)  # Явное преобразование в int
+            file_id_int = int(file_id) 
         except ValueError:
             raise HTTPException(
                 status_code=400,
