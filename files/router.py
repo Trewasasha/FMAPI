@@ -198,9 +198,9 @@ async def download_file(
                 detail="Invalid file ID format. Must be integer or start with 'temp_'"
             )
 
-        # Используем execute вместо db.get для более явного контроля
-        result = await db.execute(
-            select(FileModel).where(FileModel.id == file_id_int))
+        # Явно создаем параметризованный запрос
+        stmt = select(FileModel).where(FileModel.id == file_id_int)
+        result = await db.execute(stmt)
         file = result.scalars().first()
 
         if not file:
