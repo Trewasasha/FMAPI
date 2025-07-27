@@ -179,25 +179,23 @@ async def download_file(
     try:
         # Для временных ID (файлы из storage)
         if file_id.startswith("temp_"):
-            # Находим файл по относительному пути
-            result = await db.execute(
-                select(FileModel).where(FileModel.path == file_id[5:])
-            )
-            file = result.scalars().first()
+            file_path = STORAGE_DIR / file_id[5:]
+            if not file_path.exists():
+                raise HTTPException(status_code=404, detail="File not found")
             
-            if not file:
-                file_path = STORAGE_DIR / file_id[5:]
-                if not file_path.exists():
-                    raise HTTPException(status_code=404, detail="File not found")
-                
-                return FileResponse(
-                    file_path,
-                    filename=file_path.name,
-                    media_type="application/octet-stream"
-                )
+            return FileResponse(
+                file_path,
+                filename=file_path.name,
+                media_type="application/octet-stream"
+            )
         
-        # Для зарегистрированных файлов
-        file = await db.get(FileModel, int(file_id))
+        # Для зарегистрированных файлов - преобразуем в int
+        try:
+            file_id_int = int(file_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid file ID format")
+        
+        file = await db.get(FileModel, file_id_int)
         if not file:
             raise HTTPException(status_code=404, detail="File not found")
         
