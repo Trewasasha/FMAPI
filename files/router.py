@@ -171,38 +171,48 @@ async def upload_file(
 
 @router.get("/download/{file_id}", summary="Скачать файл")
 async def download_file(
-    file_id: str,
+    file_id: str,  # Всегда получаем строку из URL
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """Скачивает файл по ID (поддерживает временные ID для storage)"""
     try:
-        # Для временных ID (файлы из storage)
+        # 1. Обработка временных файлов (начинаются с 'temp_')
         if file_id.startswith("temp_"):
-            file_path = STORAGE_DIR / file_id[5:]
+            file_path = STORAGE_DIR / file_id[5:]  # Убираем 'temp_' префикс
             if not file_path.exists():
-                raise HTTPException(status_code=404, detail="File not found")
+                raise HTTPException(status_code=404, detail="File not found in storage")
             
             return FileResponse(
                 file_path,
                 filename=file_path.name,
                 media_type="application/octet-stream"
             )
-        
-        # Для зарегистрированных файлов - преобразуем в int
+
+        # 2. Обработка обычных файлов (числовые ID)
         try:
-            file_id_int = int(file_id)
+            file_id_int = int(file_id)  # Явное преобразование в int
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid file ID format")
-        
-        file = await db.get(FileModel, file_id_int)
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file ID format. Must be integer or start with 'temp_'"
+            )
+
+        # Используем execute вместо db.get для более явного контроля
+        result = await db.execute(
+            select(FileModel).where(FileModel.id == file_id_int))
+        file = result.scalars().first()
+
         if not file:
-            raise HTTPException(status_code=404, detail="File not found")
-        
+            raise HTTPException(status_code=404, detail="File not found in database")
+
         file_path = STORAGE_DIR / file.path
         if not file_path.exists():
-            raise HTTPException(status_code=404, detail="File missing in storage")
-        
+            raise HTTPException(
+                status_code=404,
+                detail="File exists in database but missing in storage"
+            )
+
         return FileResponse(
             file_path,
             filename=file.filename,
@@ -212,7 +222,7 @@ async def download_file(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Download failed: {str(e)}")
+        logger.error(f"Download failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="File download failed")
 
 @router.get("/download-multiple", summary="Скачать несколько файлов")
