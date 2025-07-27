@@ -197,7 +197,7 @@ async def download_file(
                 )
         
         # Для зарегистрированных файлов
-        file = await db.get(FileModel, file_id)
+        file = await db.get(FileModel, int(file_id))
         if not file:
             raise HTTPException(status_code=404, detail="File not found")
         
