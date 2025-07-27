@@ -171,7 +171,7 @@ async def upload_file(
 
 @router.get("/download/{file_id}", summary="Скачать файл")
 async def download_file(
-    file_id: str,  # Всегда получаем строку из URL
+    file_id: str,  
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -198,7 +198,7 @@ async def download_file(
                 detail="Invalid file ID format. Must be integer or start with 'temp_'"
             )
 
-        # Явно создаем параметризованный запрос
+        # 3. Используем явный параметризованный запрос
         stmt = select(FileModel).where(FileModel.id == file_id_int)
         result = await db.execute(stmt)
         file = result.scalars().first()
