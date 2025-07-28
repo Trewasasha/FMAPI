@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query, Form
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -28,6 +28,14 @@ MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
 def generate_file_id(path: str) -> str:
     """Генерация временного ID для файлов из storage"""
     return f"temp_{hashlib.md5(path.encode()).hexdigest()[:8]}"
+
+def hash_file(file_path: Path) -> str:
+    """Вычисляет MD5 хэш файла"""
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
 
 async def is_admin_active(db: AsyncSession) -> bool:
     """Проверяет, активен ли администратор"""
@@ -148,7 +156,10 @@ async def upload_file(
         db_file = FileModel(
             filename=file.filename,
             path=unique_name,
-            owner_id=user.id
+            size=len(contents),
+            modified=datetime.utcnow(),
+            owner_id=user.id,
+            hash=hash_file(file_path)
         )
         db.add(db_file)
         await db.commit()
@@ -175,7 +186,6 @@ async def download_file(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    print(file_id, user)
     """Скачивает файл по ID (поддерживает временные ID для storage)"""
     try:
         # 1. Обработка временных файлов (начинаются с 'temp_')
@@ -281,10 +291,14 @@ async def register_file(
         if existing.scalars().first():
             raise HTTPException(status_code=400, detail="File already registered")
         
+        stat = file_path.stat()
         db_file = FileModel(
             filename=filename or file_path.name,
             path=path,
-            owner_id=user.id
+            size=stat.st_size,
+            modified=datetime.fromtimestamp(stat.st_mtime),
+            owner_id=user.id,
+            hash=hash_file(file_path)
         )
         db.add(db_file)
         await db.commit()
@@ -320,10 +334,14 @@ async def register_all_files(
             if item.is_file():
                 rel_path = str(item.relative_to(STORAGE_DIR))
                 if rel_path not in registered:
+                    stat = item.stat()
                     db_file = FileModel(
                         filename=item.name,
                         path=rel_path,
-                        owner_id=user.id
+                        size=stat.st_size,
+                        modified=datetime.fromtimestamp(stat.st_mtime),
+                        owner_id=user.id,
+                        hash=hash_file(item)
                     )
                     db.add(db_file)
                     new_files.append({
@@ -341,3 +359,170 @@ async def register_all_files(
         await db.rollback()
         logger.error(f"Bulk registration failed: {str(e)}")
         raise HTTPException(status_code=500, detail="Bulk registration failed")
+
+@router.post("/admin/sync-file", summary="Синхронизировать один файл")
+async def sync_file(
+    file: UploadFile = File(...),
+    path: str = Form(...),
+    hash: str = Form(...),
+    size: int = Form(...),
+    modified: float = Form(...),
+    user: User = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Синхронизирует один файл между storage и БД"""
+    try:
+        # Проверяем существование файла в БД по пути
+        existing = await db.execute(
+            select(FileModel).where(FileModel.path == path)
+        )
+        existing_file = existing.scalars().first()
+        
+        file_path = STORAGE_DIR / path
+        modified_dt = datetime.fromtimestamp(modified)
+        
+        if existing_file:
+            # Файл уже есть в БД - проверяем изменения
+            if existing_file.hash != hash or existing_file.size != size:
+                # Обновляем файл
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(file_path, "wb") as f:
+                    f.write(await file.read())
+                
+                existing_file.size = size
+                existing_file.hash = hash
+                existing_file.modified = modified_dt
+                await db.commit()
+                
+                return {"status": "updated", "id": existing_file.id}
+            else:
+                return {"status": "skipped", "id": existing_file.id}
+        else:
+            # Новый файл - сохраняем и регистрируем
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(file_path, "wb") as f:
+                f.write(await file.read())
+            
+            new_file = FileModel(
+                filename=file.filename,
+                path=path,
+                size=size,
+                hash=hash,
+                modified=modified_dt,
+                owner_id=user.id
+            )
+            db.add(new_file)
+            await db.commit()
+            await db.refresh(new_file)
+            
+            return {"status": "added", "id": new_file.id}
+            
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"File sync failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="File synchronization failed")
+
+@router.post("/admin/cleanup-files", summary="Очистка несуществующих файлов")
+async def cleanup_files(
+    storage_path: str,
+    user: User = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Удаляет записи о файлах, которых нет в storage"""
+    try:
+        # Получаем все файлы из БД
+        db_files = (await db.execute(select(FileModel))).scalars().all()
+        
+        deleted = 0
+        for file in db_files:
+            file_path = STORAGE_DIR / file.path
+            if not file_path.exists():
+                await db.delete(file)
+                deleted += 1
+        
+        await db.commit()
+        return {"deleted": deleted}
+        
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Cleanup failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Files cleanup failed")
+
+@router.post("/admin/import-file", summary="Импорт файла в БД")
+async def import_file(
+    file: UploadFile = File(...),
+    path: str = Form(...),
+    user: User = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Импортирует файл в БД (без проверки изменений)"""
+    try:
+        # Проверяем, не зарегистрирован ли уже файл
+        existing = await db.execute(
+            select(FileModel).where(FileModel.path == path)
+        )
+        if existing.scalars().first():
+            return {"status": "skipped"}
+        
+        # Сохраняем файл
+        file_path = STORAGE_DIR / path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+        
+        # Регистрируем в БД
+        stat = file_path.stat()
+        new_file = FileModel(
+            filename=file.filename,
+            path=path,
+            size=stat.st_size,
+            modified=datetime.fromtimestamp(stat.st_mtime),
+            owner_id=user.id,
+            hash=hash_file(file_path)
+        )
+        db.add(new_file)
+        await db.commit()
+        await db.refresh(new_file)
+        
+        return {"status": "imported", "id": new_file.id}
+        
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"File import failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="File import failed")
+
+@router.get("/admin/file-hashes", summary="Получить хэши файлов")
+async def get_file_hashes(
+    user: User = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Возвращает словарь {path: hash} для всех файлов в БД"""
+    try:
+        files = (await db.execute(select(FileModel))).scalars().all()
+        return {file.path: file.hash for file in files if file.hash}
+    except Exception as e:
+        logger.error(f"Failed to get file hashes: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve file hashes")
+
+@router.get("/admin/storage-stats", summary="Статистика storage")
+async def get_storage_stats(
+    user: User = Depends(get_current_admin)
+):
+    """Возвращает статистику по файлам в storage"""
+    try:
+        total_size = 0
+        file_count = 0
+        
+        for item in STORAGE_DIR.rglob("*"):
+            if item.is_file():
+                total_size += item.stat().st_size
+                file_count += 1
+        
+        return {
+            "total_files": file_count,
+            "total_size": total_size,
+            "storage_path": str(STORAGE_DIR)
+        }
+    except Exception as e:
+        logger.error(f"Failed to get storage stats: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get storage statistics")
