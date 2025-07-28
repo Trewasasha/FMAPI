@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query, Form
+from fastapi import APIRouter, Request, UploadFile, File, Depends, HTTPException, Query, Form
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -424,10 +424,15 @@ async def sync_file(
 
 @router.post("/admin/cleanup-files", summary="Очистка несуществующих файлов")
 async def cleanup_files(
+    request: Request,
     storage_path: str,
     user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db)
 ):
+    print("Received storage_path:", storage_path)  # Логируем входные данные
+    if not storage_path:
+        raise HTTPException(status_code=422, detail="storage_path is required")
+    
     """Удаляет записи о файлах, которых нет в storage"""
     try:
         # Получаем все файлы из БД
