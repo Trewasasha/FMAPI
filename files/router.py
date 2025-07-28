@@ -5,6 +5,7 @@ from sqlalchemy.future import select
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Optional
+from pydantic import BaseModel
 import io
 import uuid
 import hashlib
@@ -24,6 +25,9 @@ logger = logging.getLogger(__name__)
 STORAGE_DIR = Path(settings.STORAGE_DIR)
 ADMIN_ACTIVITY_TIMEOUT = timedelta(minutes=5)  # 5 минут активности админа
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+
+class CleanupRequest(BaseModel):
+    storage_path: str
 
 def generate_file_id(path: str) -> str:
     """Генерация временного ID для файлов из storage"""
@@ -424,20 +428,16 @@ async def sync_file(
 
 @router.post("/admin/cleanup-files", summary="Очистка несуществующих файлов")
 async def cleanup_files(
-    request: Request,
-    storage_path: str,
+    request: CleanupRequest,  # Используем Pydantic модель
     user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    print("Received storage_path:", storage_path)  # Логируем входные данные
+    storage_path = request.storage_path  # Получаем параметр из модели
     if not storage_path:
         raise HTTPException(status_code=422, detail="storage_path is required")
     
-    """Удаляет записи о файлах, которых нет в storage"""
     try:
-        # Получаем все файлы из БД
         db_files = (await db.execute(select(FileModel))).scalars().all()
-        
         deleted = 0
         for file in db_files:
             file_path = STORAGE_DIR / file.path
@@ -447,7 +447,6 @@ async def cleanup_files(
         
         await db.commit()
         return {"deleted": deleted}
-        
     except Exception as e:
         await db.rollback()
         logger.error(f"Cleanup failed: {str(e)}")
